@@ -12,6 +12,7 @@ mvn clean package
 
 echo ""
 echo "=== Running ECS S3 Permission Manager ==="
+echo "Features: Parallel processing (10 threads), Batch processing (1000 objects/batch), Checkpoint resume"
 java -jar target/ecs-s3-permission-1.0-SNAPSHOT-jar-with-dependencies.jar
 
 echo ""

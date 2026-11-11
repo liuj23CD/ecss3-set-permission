@@ -2,15 +2,16 @@ package com.example;
 
 import software.amazon.awssdk.auth.credentials.AwsBasicCredentials;
 import software.amazon.awssdk.auth.credentials.StaticCredentialsProvider;
-import software.amazon.awssdk.core.client.config.ClientOverrideConfiguration;
-import software.amazon.awssdk.core.sync.RequestBody;
 import software.amazon.awssdk.regions.Region;
 import software.amazon.awssdk.services.s3.S3Client;
 import software.amazon.awssdk.services.s3.model.*;
 
+import java.io.*;
 import java.net.URI;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.*;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * ECS S3 Bucket Permission Manager
@@ -26,6 +27,11 @@ public class EcsS3Permission {
 
     // 目标用户
     private static final String TARGET_USER = System.getenv("ECS_S3_ACCESS_TARGET_USER");
+
+    // 并行处理配置
+    private static final int BATCH_SIZE = 1000;           // 每批处理对象数量
+    private static final int THREAD_COUNT = 10;           // 并行线程数
+    private static final String CHECKPOINT_FILE = "/tmp/ecs_permission_checkpoint.txt"; // 断点续传文件路径
 
     public static void main(String[] args) {
         System.out.println("=== ECS S3 Permission Manager ===");
@@ -74,6 +80,55 @@ public class EcsS3Permission {
                 .build();
 
         return s3Client;
+    }
+
+    /**
+     * 从断点文件读取已处理的对象列表
+     */
+    private static ConcurrentHashMap<String, Boolean> loadCheckpoint() {
+        ConcurrentHashMap<String, Boolean> processedObjects = new ConcurrentHashMap<>();
+        File checkpointFile = new File(CHECKPOINT_FILE);
+        
+        if (checkpointFile.exists()) {
+            try (BufferedReader reader = new BufferedReader(new FileReader(checkpointFile))) {
+                String line;
+                while ((line = reader.readLine()) != null) {
+                    String[] parts = line.split(":", 2);
+                    if (parts.length == 2) {
+                        processedObjects.put(parts[0], Boolean.valueOf(parts[1]));
+                    }
+                }
+                System.out.println("  - Loaded checkpoint: " + processedObjects.size() + " objects processed");
+            } catch (Exception e) {
+                System.out.println("  - Warning: Failed to load checkpoint file: " + e.getMessage());
+            }
+        }
+        
+        return processedObjects;
+    }
+
+    /**
+     * 将已处理的对象保存到断点文件
+     */
+    private static void saveCheckpoint(ConcurrentHashMap<String, Boolean> processedObjects) {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(CHECKPOINT_FILE))) {
+            for (String key : processedObjects.keySet()) {
+                writer.write(key + ":" + processedObjects.get(key));
+                writer.newLine();
+            }
+        } catch (Exception e) {
+            System.out.println("  - Warning: Failed to save checkpoint file: " + e.getMessage());
+        }
+    }
+
+    /**
+     * 清除断点文件
+     */
+    private static void clearCheckpoint() {
+        File checkpointFile = new File(CHECKPOINT_FILE);
+        if (checkpointFile.exists()) {
+            checkpointFile.delete();
+        }
     }
 
     /**
@@ -159,40 +214,37 @@ public class EcsS3Permission {
     }
 
     /**
-     * 授予bucket下所有对象的只读权限
+     * 授予bucket下所有对象的只读权限（优化版：流式处理+并行处理+断点续传）
      */
     private static void grantObjectReadOnlyPermission(S3Client s3Client) {
         System.out.println("\nGranting object read permissions to user: " + TARGET_USER);
 
+        // 加载断点
+        ConcurrentHashMap<String, Boolean> processedObjects = loadCheckpoint();
+        
+        // 创建线程池
+        ExecutorService executor = Executors.newFixedThreadPool(THREAD_COUNT);
+        CountDownLatch latch = new CountDownLatch(1);
+        
         try {
-            // 列出bucket中的所有对象
+            // 列出bucket中的所有对象（流式处理，不加载全部到内存）
             ListObjectsV2Request listRequest = ListObjectsV2Request.builder()
                     .bucket(BUCKET_NAME)
                     .build();
 
             ListObjectsV2Response listResponse = s3Client.listObjectsV2(listRequest);
-            List<S3Object> objects = listResponse.contents();
+            
+            // 统计信息
+            AtomicInteger totalObjects = new AtomicInteger(0);
+            AtomicInteger processed = new AtomicInteger(processedObjects.size());
+            AtomicInteger skipped = new AtomicInteger(0);
+            AtomicInteger failed = new AtomicInteger(0);
 
-            System.out.println("  - Found " + objects.size() + " objects in bucket");
+            // 处理当前页
+            processObjectsBatch(s3Client, listResponse.contents(), executor, latch, processedObjects, 
+                processed, skipped, failed, totalObjects);
 
-            if (objects.isEmpty()) {
-                System.out.println("  - No objects to process");
-                return;
-            }
-
-            int processed = 0;
-            int skipped = 0;
-
-            for (S3Object object : objects) {
-                String objectKey = object.key();
-                if (grantObjectReadPermission(s3Client, objectKey)) {
-                    processed++;
-                } else {
-                    skipped++;
-                }
-            }
-
-            // 处理分页
+            // 处理分页（流式处理，逐页处理）
             while (listResponse.isTruncated()) {
                 ListObjectsV2Request listRequestNext = ListObjectsV2Request.builder()
                         .bucket(BUCKET_NAME)
@@ -200,29 +252,124 @@ public class EcsS3Permission {
                         .build();
 
                 listResponse = s3Client.listObjectsV2(listRequestNext);
-                objects = listResponse.contents();
+                
+                processObjectsBatch(s3Client, listResponse.contents(), executor, latch, processedObjects,
+                    processed, skipped, failed, totalObjects);
 
-                for (S3Object object : objects) {
-                    String objectKey = object.key();
-                    if (grantObjectReadPermission(s3Client, objectKey)) {
-                        processed++;
-                    } else {
-                        skipped++;
-                    }
+                // 每处理10万条输出一次进度
+                if (totalObjects.get() % 100000 == 0) {
+                    System.out.println("  - Progress: processed " + totalObjects.get() + " objects, " + 
+                        processed.get() + " granted, " + skipped.get() + " skipped, " + failed.get() + " failed");
+                    // 保存断点
+                    saveCheckpoint(processedObjects);
                 }
             }
 
-            System.out.println("  - Processing complete: " + processed + " granted, " + skipped + " skipped");
+            // 等待所有任务完成
+            latch.countDown();
+            executor.shutdown();
+            executor.awaitTermination(1, TimeUnit.HOURS);
+
+            // 保存最终断点
+            saveCheckpoint(processedObjects);
+
+            System.out.println("  - Processing complete: " + processed.get() + " granted, " + skipped.get() + " skipped, " + failed.get() + " failed");
 
             // 输出成功和失败清单
             System.out.println("\n=== Permission Grant Summary ===");
-            System.out.println("Total objects processed: " + (processed + skipped));
-            System.out.println("Successfully granted: " + processed);
-            System.out.println("Skipped/Failed: " + skipped);
+            System.out.println("Total objects processed: " + totalObjects.get());
+            System.out.println("Successfully granted: " + processed.get());
+            System.out.println("Skipped (already granted): " + skipped.get());
+            System.out.println("Failed: " + failed.get());
+
+            // 清除断点文件
+            clearCheckpoint();
 
         } catch (Exception e) {
             System.out.println("  - Failed to list objects: " + e.getMessage());
-            throw e;
+            e.printStackTrace();
+            // 出错时保存断点
+            saveCheckpoint(processedObjects);
+            throw new RuntimeException(e);
+        } finally {
+            executor.shutdownNow();
+            try {
+                executor.awaitTermination(10, TimeUnit.SECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+    }
+
+    /**
+     * 批量处理对象（支持并行处理和断点续传）
+     */
+    private static void processObjectsBatch(S3Client s3Client, List<S3Object> objects, 
+            ExecutorService executor, CountDownLatch latch,
+            ConcurrentHashMap<String, Boolean> processedObjects,
+            AtomicInteger processed, AtomicInteger skipped, AtomicInteger failed, AtomicInteger total) {
+        
+        List<Future<Boolean>> futures = new ArrayList<>();
+        
+        for (S3Object object : objects) {
+            String objectKey = object.key();
+            total.incrementAndGet();
+            
+            // 检查是否已处理过
+            if (processedObjects.containsKey(objectKey)) {
+                Boolean success = processedObjects.get(objectKey);
+                if (success) {
+                    skipped.incrementAndGet();
+                } else {
+                    failed.incrementAndGet();
+                }
+                continue;
+            }
+            
+            // 提交任务到线程池
+            Future<Boolean> future = executor.submit(() -> {
+                try {
+                    boolean result = grantObjectReadPermission(s3Client, objectKey);
+                    processedObjects.put(objectKey, result);
+                    if (result) {
+                        processed.incrementAndGet();
+                    } else {
+                        skipped.incrementAndGet();
+                    }
+                    return result;
+                } catch (Exception e) {
+                    processedObjects.put(objectKey, false);
+                    failed.incrementAndGet();
+                    return false;
+                }
+            });
+            
+            futures.add(future);
+            
+            // 控制批处理大小，避免内存溢出
+            if (futures.size() >= BATCH_SIZE) {
+                waitForFutures(futures);
+                futures.clear();
+            }
+        }
+        
+        // 处理剩余的future
+        waitForFutures(futures);
+    }
+
+    /**
+     * 等待一批future完成
+     */
+    private static void waitForFutures(List<Future<Boolean>> futures) {
+        for (Future<Boolean> future : futures) {
+            try {
+                future.get(5, TimeUnit.MINUTES);
+            } catch (TimeoutException e) {
+                System.out.println("  - Warning: Task timeout");
+                future.cancel(true);
+            } catch (Exception e) {
+                System.out.println("  - Warning: Task failed: " + e.getMessage());
+            }
         }
     }
 
